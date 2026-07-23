@@ -1,0 +1,22 @@
+# Keep the build context small and never ship secrets or build output.
+target/
+*.log
+heapdump.hprof
+
+# Secrets / local state — must never enter an image layer.
+vault.env
+*.env
+Unseal_Key.txt
+
+# VCS / IDE / OS noise
+.git/
+.gitignore
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# Docs and deploy manifests aren't needed inside the image
+docs/
+k8s/
+README.md
