@@ -13,7 +13,7 @@ set -Eeuo pipefail
 # and Postgres reachable with the admin creds below.
 
 export VAULT_ADDR="${VAULT_ADDR:-http://127.0.0.1:8200}"
-VAULT_HOME="${VAULT_HOME:-/Users/2337057/Applications/HashiCorp/vault}"
+VAULT_HOME="${VAULT_HOME:-/Users/kiran/Applications/HashiCorp/vault}"
 VAULT="${VAULT_HOME}/vault"
 
 # Postgres admin account Vault uses ONLY to create/drop the dynamic users.
