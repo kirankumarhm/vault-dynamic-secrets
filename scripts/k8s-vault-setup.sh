@@ -6,10 +6,11 @@ set -Eeuo pipefail
 # Purpose: Production-Grade Automated Vault Configuration on Kubernetes / Floci
 #          1. Enables File Audit Logging (/vault/data/vault_audit.log)
 #          2. Enables & Configures Database Engine for PostgreSQL 18.4
-#          3. Creates Dynamic DB Role 'payments-app' (1m default / 2m max TTL)
-#          4. Configures Least-Privilege Policy 'payments-app-policy'
-#          5. Configures Secret-Less Kubernetes Auth (ServiceAccount token)
-#          6. Configures AppRole Auth (Alternative auth fallback)
+#          3. Creates Demo Role 'payments-app' (1m default / 2m max TTL)
+#          4. Creates Production Role 'payments-app-prod' (1h default / 24h max TTL)
+#          5. Configures Least-Privilege Policy 'payments-app-policy'
+#          6. Configures Secret-Less Kubernetes Auth (ServiceAccount token)
+#          7. Configures AppRole Auth (Alternative auth fallback)
 # ==============================================================================
 
 VAULT_POD="${VAULT_POD:-vault-0}"
@@ -18,7 +19,7 @@ PG_HOST="${PG_HOST:-postgres.default.svc.cluster.local}"
 PG_PORT="${PG_PORT:-5432}"
 PG_DB="${PG_DB:-payments}"
 PG_ADMIN_USER="${PG_ADMIN_USER:-postgres}"
-PG_ADMIN_PASS="${PG_ADMIN_PASS:-postgres}"
+PG_ADMIN_PASS="${PG_ADMIN_PASS:-postgrespassword}"
 
 echo "==> 1. Ensuring Vault Cryptographic File Audit Device is enabled..."
 kubectl exec -n "${VAULT_NS}" "${VAULT_POD}" -- vault audit enable file file_path=/vault/data/vault_audit.log 2>/dev/null \
@@ -30,22 +31,32 @@ kubectl exec -n "${VAULT_NS}" "${VAULT_POD}" -- vault secrets enable -path=datab
 
 echo "==> 3. Configuring PostgreSQL 18.4 database connection (database/config/${PG_DB})..."
 kubectl exec -n "${VAULT_NS}" "${VAULT_POD}" -- vault write "database/config/${PG_DB}" \
-  plugin_name=postgresql-database-plugin \
+  plugin_name="postgresql-database-plugin" \
   connection_url="postgresql://{{username}}:{{password}}@${PG_HOST}:${PG_PORT}/${PG_DB}?sslmode=disable" \
-  allowed_roles="payments-app" \
+  allowed_roles="payments-app,payments-app-prod" \
   username="${PG_ADMIN_USER}" \
   password="${PG_ADMIN_PASS}"
 
-echo "==> 4. Creating Dynamic DB Role database/roles/payments-app..."
+echo "==> 4. Creating Demo DB Role database/roles/payments-app (default_ttl=1m, max_ttl=2m)..."
 kubectl exec -n "${VAULT_NS}" "${VAULT_POD}" -- vault write database/roles/payments-app \
   db_name="${PG_DB}" \
   creation_statements="CREATE ROLE \"{{name}}\" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}'; GRANT ALL PRIVILEGES ON payments TO \"{{name}}\";" \
   default_ttl="1m" \
   max_ttl="2m"
 
-echo "==> 5. Writing Least-Privilege Policy 'payments-app-policy'..."
+echo "==> 5. Creating Production DB Role database/roles/payments-app-prod (default_ttl=1h, max_ttl=24h)..."
+kubectl exec -n "${VAULT_NS}" "${VAULT_POD}" -- vault write database/roles/payments-app-prod \
+  db_name="${PG_DB}" \
+  creation_statements="CREATE ROLE \"{{name}}\" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}'; GRANT ALL PRIVILEGES ON payments TO \"{{name}}\";" \
+  default_ttl="1h" \
+  max_ttl="24h"
+
+echo "==> 6. Writing Least-Privilege Policy 'payments-app-policy'..."
 cat <<'EOF' | kubectl exec -i -n "${VAULT_NS}" "${VAULT_POD}" -- vault policy write payments-app-policy -
 path "database/creds/payments-app" {
+  capabilities = ["read"]
+}
+path "database/creds/payments-app-prod" {
   capabilities = ["read"]
 }
 path "sys/leases/revoke" {
@@ -53,7 +64,7 @@ path "sys/leases/revoke" {
 }
 EOF
 
-echo "==> 6. Configuring Secret-Less Kubernetes Auth (auth/kubernetes)..."
+echo "==> 7. Configuring Secret-Less Kubernetes Auth (auth/kubernetes)..."
 kubectl exec -n "${VAULT_NS}" "${VAULT_POD}" -- vault auth enable kubernetes 2>/dev/null \
   && echo "    Kubernetes auth enabled" || echo "    Kubernetes auth already enabled"
 
@@ -66,7 +77,7 @@ kubectl exec -n "${VAULT_NS}" "${VAULT_POD}" -- vault write auth/kubernetes/role
   policies=payments-app-policy \
   ttl=1h
 
-echo "==> 7. Configuring AppRole Auth (auth/approle fallback)..."
+echo "==> 8. Configuring AppRole Auth (auth/approle fallback)..."
 kubectl exec -n "${VAULT_NS}" "${VAULT_POD}" -- vault auth enable approle 2>/dev/null \
   && echo "    AppRole auth enabled" || echo "    AppRole auth already enabled"
 
@@ -80,6 +91,8 @@ SECRET_ID=$(kubectl exec -n "${VAULT_NS}" "${VAULT_POD}" -- vault write -f -fiel
 echo "=============================================================================="
 echo " ✅ Vault Production Setup Complete on Kubernetes / Floci EKS!"
 echo " Audit Log Device : /vault/data/vault_audit.log"
+echo " Demo DB Role     : database/roles/payments-app      (TTL: 1m / 2m)"
+echo " Production DB Role: database/roles/payments-app-prod (TTL: 1h / 24h)"
 echo " Kubernetes Auth  : role 'payments-app' (bound to ServiceAccount vault-dynamic-secrets)"
 echo " AppRole Auth     : Role ID: ${ROLE_ID}"
 echo "                    Secret ID: ${SECRET_ID}"
