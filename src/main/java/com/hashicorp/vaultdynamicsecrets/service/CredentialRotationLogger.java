@@ -1,5 +1,6 @@
 package com.hashicorp.vaultdynamicsecrets.service;
 
+import com.hashicorp.vaultdynamicsecrets.config.VaultLeaseEndpoint;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -14,7 +15,7 @@ import java.sql.Statement;
 /**
  * Periodically polls the active PostgreSQL connection to verify connectivity and
  * explicitly logs the current dynamic database user, making rotations instantly
- * visible in logs without requiring external HTTP traffic.
+ * visible in logs and updating the /actuator/vault-lease telemetry endpoint.
  */
 @Component
 public class CredentialRotationLogger {
@@ -23,6 +24,9 @@ public class CredentialRotationLogger {
 
     @Autowired
     private DataSource dataSource;
+
+    @Autowired
+    private VaultLeaseEndpoint vaultLeaseEndpoint;
 
     private String lastKnownUser = null;
 
@@ -38,8 +42,10 @@ public class CredentialRotationLogger {
 
                 if (lastKnownUser == null) {
                     lastKnownUser = currentUser;
+                    vaultLeaseEndpoint.setCurrentUser(currentUser);
                     log.info("🔐 [VAULT DYNAMIC CREDS] Initial Active PostgreSQL User: " + currentUser + " (DB: " + database + ")");
                 } else if (!lastKnownUser.equals(currentUser)) {
+                    vaultLeaseEndpoint.recordRotation(currentUser);
                     log.info("🔄 [VAULT DYNAMIC CREDS ROTATION DETECTED] >>> Previous User: " + lastKnownUser
                             + " -> NEW Active User: " + currentUser + " <<< (Zero-downtime rotation verified!)");
                     lastKnownUser = currentUser;
