@@ -1,5 +1,4 @@
 # Keep the build context small and never ship secrets or build output.
-target/
 *.log
 heapdump.hprof
 

@@ -1,52 +1,46 @@
-# Kubernetes manifests for vault-dynamic-secrets.
-#
-# Assumes an external, HA Vault and PostgreSQL are reachable (this file does NOT
-# deploy them). The app authenticates to Vault with AppRole; role_id/secret_id
-# come from a Secret. In a real cluster prefer the Vault Secrets Operator (VSO),
-# the Vault Agent Injector, or Kubernetes auth so no secret_id is stored at all —
-# see docs/dynamic-secrets-implementations.md.
-#
-#   kubectl apply -f k8s/deployment.yaml
----
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: vault-dynamic-secrets-config
-  labels: { app: vault-dynamic-secrets }
+  namespace: default
+  labels:
+    app: vault-dynamic-secrets
 data:
-  VAULT_ADDR: "https://vault.internal:8200"
-  SPRING_DATASOURCE_URL: "jdbc:postgresql://postgres.internal:5432/payments"
-  SPRING_PROFILES_ACTIVE: "prod"
-  APP_VAULT_ROTATIONSTRATEGY: "refresh-scope"
+  VAULT_ADDR: "https://vault.vault.svc.cluster.local:8200"
+  SPRING_DATASOURCE_URL: "jdbc:postgresql://postgres.default.svc.cluster.local:5432/payments"
+  VAULT_SSL_TRUST_STORE: "file:/vault/tls/vault-truststore.jks"
+  VAULT_SSL_TRUST_STORE_PASSWORD: "changeit"
+  APP_VAULT_ROTATION_STRATEGY: "refresh-scope"
 ---
 apiVersion: v1
 kind: Secret
 metadata:
   name: vault-dynamic-secrets-approle
-  labels: { app: vault-dynamic-secrets }
+  namespace: default
+  labels:
+    app: vault-dynamic-secrets
 type: Opaque
 stringData:
-  # Placeholders — inject real values via your secret manager / CI, never commit them.
-  VAULT_APPROLE_ROLE_ID: "REPLACE_ME"
-  VAULT_APPROLE_SECRET_ID: "REPLACE_ME"
+  VAULT_APPROLE_ROLE_ID: "6428e491-937b-e743-b374-4bb9a8718ee4"
+  VAULT_APPROLE_SECRET_ID: "72522b88-a163-946a-c064-a5b31b54e5f1"
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: vault-dynamic-secrets
-  labels: { app: vault-dynamic-secrets }
+  namespace: default
+  labels:
+    app: vault-dynamic-secrets
 spec:
-  replicas: 2
+  replicas: 1
   selector:
-    matchLabels: { app: vault-dynamic-secrets }
+    matchLabels:
+      app: vault-dynamic-secrets
   template:
     metadata:
-      labels: { app: vault-dynamic-secrets }
+      labels:
+        app: vault-dynamic-secrets
     spec:
-      securityContext:
-        runAsNonRoot: true
-        seccompProfile:
-          type: RuntimeDefault
       containers:
         - name: app
           image: vault-dynamic-secrets:latest
@@ -55,35 +49,41 @@ spec:
             - name: http
               containerPort: 8080
           envFrom:
-            - configMapRef: { name: vault-dynamic-secrets-config }
-            - secretRef: { name: vault-dynamic-secrets-approle }
-          # Liveness restarts a wedged pod; readiness gates traffic; startup gives
-          # the JVM + Vault login time before the other probes begin.
-          startupProbe:
-            httpGet: { path: /actuator/health/readiness, port: http }
-            failureThreshold: 30
-            periodSeconds: 5
+            - configMapRef:
+                name: vault-dynamic-secrets-config
+            - secretRef:
+                name: vault-dynamic-secrets-approle
           readinessProbe:
-            httpGet: { path: /actuator/health/readiness, port: http }
-            periodSeconds: 10
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 5
             failureThreshold: 3
           livenessProbe:
-            httpGet: { path: /actuator/health/liveness, port: http }
-            periodSeconds: 15
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
             failureThreshold: 3
           resources:
-            requests: { cpu: "250m", memory: "512Mi" }
-            limits: { cpu: "1", memory: "768Mi" }
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop: ["ALL"]
+            requests:
+              cpu: 200m
+              memory: 384Mi
+            limits:
+              cpu: 1000m
+              memory: 768Mi
           volumeMounts:
-            # Writable /tmp for the JVM heap-dump path; root FS stays read-only.
+            - name: vault-truststore
+              mountPath: /vault/tls
+              readOnly: true
             - name: tmp
               mountPath: /tmp
       volumes:
+        - name: vault-truststore
+          secret:
+            secretName: vault-truststore
         - name: tmp
           emptyDir: {}
 ---
@@ -91,11 +91,14 @@ apiVersion: v1
 kind: Service
 metadata:
   name: vault-dynamic-secrets
-  labels: { app: vault-dynamic-secrets }
+  namespace: default
+  labels:
+    app: vault-dynamic-secrets
 spec:
   type: ClusterIP
-  selector: { app: vault-dynamic-secrets }
+  selector:
+    app: vault-dynamic-secrets
   ports:
     - name: http
-      port: 80
-      targetPort: http
+      port: 8080
+      targetPort: 8080

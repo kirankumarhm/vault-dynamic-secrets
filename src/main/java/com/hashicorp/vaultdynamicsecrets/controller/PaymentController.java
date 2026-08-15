@@ -17,6 +17,7 @@ import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
+import java.util.Map;
 
 @RestController
 @RequestMapping(path = "/payments", produces = MediaType.APPLICATION_JSON_VALUE)
@@ -33,6 +34,11 @@ public class PaymentController {
             @RequestParam(defaultValue = ApiConstants.DEFAULT_PAGE) int page,
             @RequestParam(defaultValue = ApiConstants.DEFAULT_SIZE) int size) {
         return service.list(page, size);
+    }
+
+    @GetMapping("/db-status")
+    public Map<String, Object> getDbStatus() {
+        return service.getDbStatus();
     }
 
     @GetMapping("/{id}")

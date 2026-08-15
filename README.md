@@ -304,6 +304,7 @@ mvn -DskipTests clean package
 | Method | Path | Body | Notes |
 |--------|------|------|-------|
 | `GET`  | `/payments?page=0&size=20` | — | Paginated. `size` clamped to 1–100. |
+| `GET`  | `/payments/db-status` | — | Returns active Vault-issued DB user, DB name, server timestamp, and total count. |
 | `GET`  | `/payments/{id}` | — | 404 if not found. |
 | `POST` | `/payments` | `{"name":"...","cc_info":"..."}` | Validated; 201 on success, 400 on bad input. |
 
@@ -391,16 +392,35 @@ curl -s "$BASE/actuator/prometheus" | head
 
 The DB lease has `max_ttl=2m`. Roughly every couple of minutes the lease hits its
 ceiling, Vault expires it, and Spring rebuilds the datasource with a brand-new
-Postgres user. Watch it live:
+Postgres user.
 
-```bash
-tail -f app.log | grep -iE 'Rebuilt datasource|Refreshed database credentials|lease'
+The application includes real-time lease listeners and a 15-second background database
+heartbeat (`CredentialRotationLogger`) so rotations are immediately visible in the logs:
+
+```text
+# 1. Lease reaches max TTL (2m)
+INFO --- [g-Cloud-Vault-2] c.h.v.c.VaultRefresher$$SpringCGLIB$$0   : ⚠️ [VAULT LEASE EXPIRED] Lease database/creds/payments-app/... reached max TTL and expired! Triggering @RefreshScope Context Refresh...
+INFO --- [g-Cloud-Vault-2] c.h.v.c.VaultRefresher$$SpringCGLIB$$0   : 🔐 [VAULT LEASE CREATED] Initial dynamic credential issued: v-approle-payments-G9B8uv2aI06QInyayYXh-1786808032 | Lease ID: database/creds/payments-app/... | TTL: PT1Ms
+
+# 2. HikariCP pool cleanly drained and rebuilt with new user
+INFO --- [g-Cloud-Vault-2] com.zaxxer.hikari.HikariDataSource       : HikariPool-1 - Shutdown completed.
+INFO --- [g-Cloud-Vault-2] c.h.v.c.VaultRefresher$$SpringCGLIB$$0   : ✅ [CONTEXT REFRESHED] Database credentials refreshed for database/creds/payments-app
+
+# 3. Next query or scheduled heartbeat acquires connection with new user
+INFO --- [scheduling-1] c.h.v.c.DataSourceConfig$$SpringCGLIB$$0 : 🔄 [DATASOURCE REBUILT] >>> Active Database User: v-approle-payments-G9B8uv2aI06QInyayYXh-1786808032 (JDBC URL: jdbc:postgresql://postgres.default.svc.cluster.local:5432/payments)
+INFO --- [scheduling-1] com.zaxxer.hikari.HikariDataSource       : HikariPool-2 - Start completed.
+INFO --- [scheduling-1] c.h.v.service.CredentialRotationLogger   : 🔄 [VAULT DYNAMIC CREDS ROTATION DETECTED] >>> Previous User: v-approle-payments-PRpmyAaVJ9nwCfPErVb2-1786807932 -> NEW Active User: v-approle-payments-G9B8uv2aI06QInyayYXh-1786808032 <<< (Zero-downtime rotation verified!)
 ```
 
-Each rotation logs a **different** Vault-issued username — that is the dynamic
-credential changing under the running app. The periodic
-`Cannot renew lease ... 400 lease expired` WARN is **expected** (it's the lease
-hitting `max_ttl`); the app immediately fetches fresh credentials and continues.
+Watch live in Kubernetes:
+```bash
+kubectl logs -l app=vault-dynamic-secrets -n default -f
+```
+
+Inspect active database user via REST API:
+```bash
+curl -s http://localhost:8080/payments/db-status | jq .
+```
 
 ### Unit / integration tests
 
@@ -472,15 +492,26 @@ writes `role_id`/`secret_id` to a shared volume the app sources at startup. Swit
 rotation strategy with `APP_VAULT_ROTATIONSTRATEGY=mxbean` on the `app` service.
 Dev Vault is in-memory (root token `root`) — **local only**.
 
-### Kubernetes
+### Kubernetes & Floci EKS
 
-[`k8s/deployment.yaml`](k8s/deployment.yaml) — Deployment (2 replicas) + Service +
-ConfigMap + Secret. Includes startup/readiness/liveness probes on the actuator
-health groups, resource requests/limits, and a hardened `securityContext`
-(`runAsNonRoot`, `readOnlyRootFilesystem`, all capabilities dropped, writable
-`/tmp` for heap dumps). AppRole creds come from a Secret.
+> **Full Production Guide** — HashiCorp Vault 3-Node Raft HA, AWS KMS Auto-Unseal on Floci, PostgreSQL 18.4, and TLS Truststore setup: see
+> [docs/floci-eks-production-setup.md](docs/floci-eks-production-setup.md).
 
+[`k8s/deployment.yaml`](k8s/deployment.yaml) — Deployment + Service + ConfigMap + AppRole Secret + TLS Truststore volume mount. Includes startup/readiness/liveness probes on Actuator health groups, resource requests/limits, and a hardened `securityContext`.
+
+Automated Kubernetes Vault setup:
 ```bash
+./scripts/k8s-vault-setup.sh
+```
+
+Deploying to Kubernetes:
+```bash
+# 1. Build and load into k3s / EKS containerd
+mvn clean package -DskipTests
+docker build -t vault-dynamic-secrets:latest .
+docker save vault-dynamic-secrets:latest | docker exec -i floci-eks-vault-floci ctr -n k8s.io images import -
+
+# 2. Apply Kubernetes manifests
 kubectl apply -f k8s/deployment.yaml
 ```
 

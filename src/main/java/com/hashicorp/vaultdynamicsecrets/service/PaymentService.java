@@ -10,8 +10,15 @@ import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import javax.sql.DataSource;
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -24,9 +31,11 @@ import java.util.UUID;
 public class PaymentService {
 
     private final PaymentRepository repository;
+    private final DataSource dataSource;
 
-    public PaymentService(PaymentRepository repository) {
+    public PaymentService(PaymentRepository repository, DataSource dataSource) {
         this.repository = repository;
+        this.dataSource = dataSource;
     }
 
     /**
@@ -53,6 +62,31 @@ public class PaymentService {
         var saved = repository.save(
                 new Payment(UUID.randomUUID().toString(), name, ccInfo, Instant.now()));
         return toResponse(saved);
+    }
+
+    /**
+     * Inspect active database connection and return current Vault dynamic user info.
+     */
+    public Map<String, Object> getDbStatus() {
+        Map<String, Object> response = new HashMap<>();
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT current_user, current_database(), now()")) {
+
+            if (rs.next()) {
+                response.put("status", "HEALTHY");
+                response.put("currentUser", rs.getString(1));
+                response.put("database", rs.getString(2));
+                response.put("serverTime", rs.getString(3));
+            }
+            response.put("totalPayments", repository.count());
+            return response;
+
+        } catch (SQLException e) {
+            response.put("status", "ERROR");
+            response.put("error", e.getMessage());
+            return response;
+        }
     }
 
     private static PaymentResponse toResponse(Payment p) {

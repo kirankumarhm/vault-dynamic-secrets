@@ -39,7 +39,8 @@ public class DataSourceConfig {
                 .password(properties.getPassword())
                 .build();
         // Log the Vault-issued username only — NEVER the password (secrets must not reach logs).
-        log.info("Rebuilt datasource with Vault-issued user " + properties.getUsername());
+        log.info("🔄 [DATASOURCE REBUILT] >>> Active Database User: " + properties.getUsername()
+                + " (JDBC URL: " + properties.getUrl() + ")");
         return db;
     }
 }

@@ -18,20 +18,6 @@ import static org.springframework.vault.core.lease.domain.RequestedSecret.Mode.R
  * {@code @RefreshScope} DataSource via a context refresh (see
  * {@link VaultRefresher}), this hot-swaps the username/password directly on the
  * live HikariCP pool and soft-evicts idle connections.
- *
- * <p>Lower overhead than a context refresh — nothing else in the context is torn
- * down, and there is no lazy "rebuild on next request" gap. In-use connections
- * finish their work and are evicted when returned; new connections use the new
- * credential immediately.
- *
- * <p>Flow: the renewable lease hits {@code max_ttl} → {@link SecretLeaseExpiredEvent}
- * in {@code RENEW} mode → we ask the container for a <em>rotating</em> secret →
- * Vault mints a fresh credential → {@link SecretLeaseCreatedEvent} in {@code ROTATE}
- * mode carries it → we push it into the pool.
- *
- * <p>Active only when {@code app.vault.rotation-strategy=mxbean}. Under this
- * strategy {@link DataSourceConfig} backs off and Boot auto-configures a plain
- * HikariCP DataSource, which is injected here.
  */
 @Configuration
 @ConditionalOnProperty(name = "app.vault.rotation-strategy", havingValue = "mxbean")
@@ -53,7 +39,7 @@ public class HikariCredentialRotator {
             if (event instanceof SecretLeaseExpiredEvent && event.getSource().getMode() == RENEW) {
                 // The renewable lease reached max_ttl and can't be renewed. Switch the
                 // requested secret to ROTATE so the next event carries a brand-new credential.
-                log.info("Lease expired for " + credsPath + " — switching RENEW -> ROTATE");
+                log.info("⚠️ [VAULT LEASE EXPIRED] Lease expired for " + credsPath + " — switching RENEW -> ROTATE to mint fresh credentials");
                 leaseContainer.requestRotatingSecret(credsPath);
             } else if (event instanceof SecretLeaseCreatedEvent created
                     && event.getSource().getMode() == ROTATE) {
@@ -65,8 +51,8 @@ public class HikariCredentialRotator {
                 hikariDataSource.getHikariConfigMXBean().setUsername(username);
                 hikariDataSource.getHikariConfigMXBean().setPassword(password);
                 hikariDataSource.getHikariPoolMXBean().softEvictConnections();
-                log.info("Rotated datasource credentials to Vault-issued user " + username
-                        + " (HikariCP soft-evict, no context refresh)");
+                log.info("🔄 [HIKARICP MXBEAN ROTATION] >>> Live DataSource user hot-swapped to: " + username
+                        + " (Soft-evicted idle pool connections, zero context teardown)");
             }
         });
     }
