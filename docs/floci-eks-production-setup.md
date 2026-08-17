@@ -70,325 +70,409 @@ graph TB
 
 ---
 
-## 2. Step-by-Step Production Setup
+## 2. Prerequisites
 
-### Step 1: Create the EKS Cluster Role
-EKS needs an IAM role to manage resources on your behalf.
-
-2.1 Create a trust policy (save as `cluster-trust-policy.json`):
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": {
-        "Service": "eks.amazonaws.com"
-      },
-      "Action": "sts:AssumeRole"
-    }
-  ]
-}
-```
-2.2 Create the role and attach the required AWS managed policy:
+- Docker Desktop running with at least 8 GB of memory allocated
+- CLI utilities: `aws`, `kubectl`, `helm`, `jq`, `openssl`, `keytool` (JDK 21+), `mvn`
 
 ```bash
+brew install awscli kubectl helm jq openssl
+```
 
+---
+
+## 3. Infrastructure Setup: Floci EKS & Vault HA 3-Node Cluster
+
+### Step 1: Start Floci AWS Emulator
+
+Create or verify `docker-compose-floci.yml`:
+
+```yaml
+services:
+  floci:
+    image: floci/floci@sha256:b3b3a70a294b8ba8095385b8571ea1e4d44d494950d98de5e812cd9de02f506b
+    ports:
+      - "4566:4566"
+    environment:
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      SERVICES: eks,kms,s3,iam
+    volumes:
+      - floci-data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - vault-network
+
+networks:
+  vault-network:
+    driver: bridge
+
+volumes:
+  floci-data:
+```
+
+Start the container and wait until healthy:
+
+```bash
+docker compose -f docker-compose-floci.yml up -d
+
+until curl --fail --silent http://localhost:4566/health >/dev/null; do
+  echo "Waiting for Floci..."
+  sleep 2
+done
+```
+
+> **Note on Docker Socket:** `/var/run/docker.sock` is required by Floci to start and manage the local k3s container for the EKS service.
+
+---
+
+### Step 2: Configure AWS CLI for Floci
+
+Export emulator credentials into your shell:
+
+```bash
+export AWS_REGION=us-east-1
+export AWS_DEFAULT_REGION="$AWS_REGION"
 export AWS_ENDPOINT_URL=http://localhost:4566
-export AWS_DEFAULT_REGION=us-east-1
 export AWS_ACCESS_KEY_ID=test
 export AWS_SECRET_ACCESS_KEY=test
 
-
-aws iam create-role \
-  --role-name EKSClusterRole \
-  --assume-role-policy-document file://cluster-trust-policy.json
-
-aws iam attach-role-policy \
-  --role-name EKSClusterRole \
-  --policy-arn arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+aws sts get-caller-identity
+aws eks list-clusters
 ```
 
+---
 
-### Step 2: Create the EKS Cluster
-Replace the subnet IDs with the subnets from your VPC. This process takes about 10-15 minutes to complete.
+### Step 3: Create the Floci EKS Cluster
+
+Floci starts a local k3s container when you create an EKS cluster:
+
 ```bash
+export EKS_CLUSTER_NAME=vault-floci
+
 aws eks create-cluster \
-  --name vault-cluster \
-  --region us-east-1 \
-  --role-arn arn:aws:iam::YOUR_ACCOUNT_ID:role/EKSClusterRole \
-  --resources-vpc-config subnetIds=subnet-12345,subnet-67890
+  --name "$EKS_CLUSTER_NAME" \
+  --role-arn arn:aws:iam::000000000000:role/eks-role \
+  --resources-vpc-config 'subnetIds=[],securityGroupIds=[]' \
+  --kubernetes-version 1.29
+
+aws eks wait cluster-active \
+  --name "$EKS_CLUSTER_NAME" \
+  --region "$AWS_REGION"
+
+aws eks update-kubeconfig \
+  --name "$EKS_CLUSTER_NAME" \
+  --region "$AWS_REGION"
+
+kubectl config current-context
+kubectl get nodes -o wide
 ```
-Wait for the cluster status to become ACTIVE before proceeding. You can check the status with:
+
+Expected result: one Ready k3s control-plane node.
+
+---
+
+### Step 4: Create the Namespace and TLS Secrets
+
+Vault's Helm values mount two Secrets named `tls-ca` and `tls-server`. Create the `vault` namespace and secrets before deploying Vault:
 
 ```bash
-aws eks describe-cluster --name vault-cluster --query "cluster.status"
+kubectl create namespace vault --dry-run=client -o yaml | kubectl apply -f -
+
+# Generate CA and server certificates if not already generated in tls/
+mkdir -p tls
+if [ ! -f tls/ca.crt ] || [ ! -f tls/vault.crt ]; then
+  openssl req -x509 -newkey rsa:4096 -days 365 -nodes \
+    -keyout tls/ca.key -out tls/ca.crt -subj "/CN=Vault-Internal-CA"
+
+  openssl req -newkey rsa:2048 -nodes \
+    -keyout tls/vault.key -out tls/vault.csr \
+    -subj "/CN=vault.vault.svc.cluster.local"
+
+  openssl x509 -req -in tls/vault.csr -CA tls/ca.crt -CAkey tls/ca.key \
+    -CAcreateserial -out tls/vault.crt -days 365 \
+    -extfile <(printf "subjectAltName=DNS:vault,DNS:vault.vault,DNS:vault.vault.svc,DNS:vault.vault.svc.cluster.local,DNS:*.vault-internal,IP:127.0.0.1")
+fi
+
+kubectl create secret generic tls-ca \
+  --from-file=ca.crt=tls/ca.crt \
+  --namespace vault \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl create secret tls tls-server \
+  --cert=tls/vault.crt \
+  --key=tls/vault.key \
+  --namespace vault \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl get secrets -n vault tls-ca tls-server
 ```
 
-### Step 3: Create the Node Group
-The EC2 instances (nodes) running your containers also need an IAM role.
-3.1 Create the node trust policy (save as `node-trust-policy.json`):
+---
 
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": {
-        "Service": "ec2.amazonaws.com"
+### Step 5: Create Floci KMS, S3, and IAM Resources
+
+```bash
+KMS_KEY=$(aws kms create-key \
+  --description "Vault auto-unseal key (Floci)" \
+  --query 'KeyMetadata.KeyId' \
+  --output text)
+
+aws kms create-alias \
+  --alias-name alias/vault-autounseal \
+  --target-key-id "$KMS_KEY"
+
+aws s3 mb s3://vault-backups
+aws s3api put-bucket-versioning \
+  --bucket vault-backups \
+  --versioning-configuration Status=Enabled
+
+printf '%s\n' "$KMS_KEY" > kms-key-id.txt
+
+aws iam create-user --user-name vault-autounseal
+
+aws iam put-user-policy \
+  --user-name vault-autounseal \
+  --policy-name vault-autounseal-policy \
+  --policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Action": ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey", "kms:DescribeKey"],
+        "Resource": "*"
       },
-      "Action": "sts:AssumeRole"
-    }
-  ]
-}
-```
-
-3.2 Create the role and attach the necessary node policies:
-
-```bash
-aws iam create-role \
-  --role-name EKSNodeRole \
-  --assume-role-policy-document file://node-trust-policy.json
-
-aws iam attach-role-policy \
-  --role-name EKSNodeRole \
-  --policy-arn arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
-
-aws iam attach-role-policy \
-  --role-name EKSNodeRole \
-  --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
-
-aws iam attach-role-policy \
-  --role-name EKSNodeRole \
-  --policy-arn arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
-```
-
-3.3 Create the managed node group:
-
-```bash
-aws eks create-nodegroup \
-  --cluster-name vault-cluster \
-  --nodegroup-name standard-workers \
-  --node-role arn:aws:iam::YOUR_ACCOUNT_ID:role/EKSNodeRole \
-  --subnets subnet-12345 subnet-67890 \
-  --instance-types t3.medium \
-  --scaling-config minSize=1,maxSize=4,desiredSize=3
-```
-
-### Step 4: Register the OIDC Provider for the Cluster
-To map AWS IAM roles to Kubernetes service accounts (IRSA), you must register the cluster's OIDC issuer with AWS IAM.
-4.1 Get the OIDC Issuer URL:
-
-```bash
-aws eks describe-cluster \
-  --name vault-cluster \
-  --query "cluster.identity.oidc.issuer" \
-  --output text
-```
-
-(Example output: [https://oidc.eks.us-east-1.amazonaws.com/id/EXAMPLED539D4633E53E51EXAMPLE](https://oidc.eks.us-east-1.amazonaws.com/id/EXAMPLED539D4633E53E51EXAMPLE))
-4.2 Create the IAM OIDC Provider:
-(Note: 9e99a48a9960b14926bb7f3b02e22da2b0ab7280 is the standard AWS root CA thumbprint for EKS OIDC).
-
-```bash
-aws iam create-open-id-connect-provider \
-  --url <YOUR_OIDC_ISSUER_URL> \
-  --client-id-list "sts.amazonaws.com" \
-  --thumbprint-list "9e99a48a9960b14926bb7f3b02e22da2b0ab7280"
-```
-
-### Step 5: Create the Vault IAM Role (IRSA)
-Now, create the role that Vault will actually use.
-5.1 Create the Vault IAM Policy (save as vault-policy.json):
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "kms:Encrypt",
-        "kms:Decrypt",
-        "kms:DescribeKey"
-      ],
-      "Resource": "arn:aws:kms:us-east-1:YOUR_ACCOUNT_ID:key/YOUR_KMS_KEY_ID"
-    }
-  ]
-}
-```
-
-```bash
-aws iam create-policy \
-  --policy-name VaultKMSUnsealPolicy \
-  --policy-document file://vault-policy.json
-```
-
-5.2 Create the IRSA Trust Policy (save as vault-irsa-trust.json).
-You must replace the OIDC_ID (the string of numbers/letters at the end of your issuer URL) and YOUR_ACCOUNT_ID.
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": {
-        "Federated": "arn:aws:iam::YOUR_ACCOUNT_ID:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/YOUR_OIDC_ID"
-      },
-      "Action": "sts:AssumeRoleWithWebIdentity",
-      "Condition": {
-        "StringEquals": {
-          "oidc.eks.us-east-1.amazonaws.com/id/YOUR_OIDC_ID:aud": "sts.amazonaws.com",
-          "oidc.eks.us-east-1.amazonaws.com/id/YOUR_OIDC_ID:sub": "system:serviceaccount:vault:vault"
-        }
+      {
+        "Effect": "Allow",
+        "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
+        "Resource": ["arn:aws:s3:::vault-backups", "arn:aws:s3:::vault-backups/*"]
       }
-    }
-  ]
-}
-```
+    ]
+  }'
 
-5.3 Create the role and attach the policy:
-'''bash
-aws iam create-role \
-  --role-name VaultEksRole \
-  --assume-role-policy-document file://vault-irsa-trust.json
+aws iam create-access-key --user-name vault-autounseal > vault-iam.json
 
-aws iam attach-role-policy \
-  --role-name VaultEksRole \
-  --policy-arn arn:aws:iam::YOUR_ACCOUNT_ID:policy/VaultKMSUnsealPolicy
-```
+export FLOCI_ACCESS_KEY=$(jq -r '.AccessKey.AccessKeyId' vault-iam.json)
+export FLOCI_SECRET_KEY=$(jq -r '.AccessKey.SecretAccessKey' vault-iam.json)
 
-### Step 6: Link the AWS Role to Kubernetes
-Finally, update your local kubeconfig and create the Kubernetes Service Account annotated with your new AWS role.
+: "${FLOCI_ACCESS_KEY:?FLOCI_ACCESS_KEY is empty}"
+: "${FLOCI_SECRET_KEY:?FLOCI_SECRET_KEY is empty}"
 
-```bash
-# Update local kubeconfig
-aws eks update-kubeconfig --region us-east-1 --name vault-cluster
-
-# Create the namespace
-kubectl create namespace vault
-
-# Create the service account with the AWS IAM role annotation
-kubectl apply -f - <<EOF
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: vault
-  namespace: vault
-  annotations:
-    eks.amazonaws.com/role-arn: arn:aws:iam::YOUR_ACCOUNT_ID:role/VaultEksRole
+cat > floci-credentials.env <<EOF
+export FLOCI_ACCESS_KEY=$FLOCI_ACCESS_KEY
+export FLOCI_SECRET_KEY=$FLOCI_SECRET_KEY
+export FLOCI_KMS_KEY=$KMS_KEY
 EOF
+chmod 600 floci-credentials.env vault-iam.json
 ```
 
+---
 
+### Step 6: Create the Vault Credentials Secret
 
+Vault retrieves its AWS credentials from the `floci-credentials` Kubernetes Secret:
 
-
-
-
-
-### Step 7: Floci AWS Emulator & KMS Auto-Unseal Key
-Ensure Floci is running locally (`http://localhost:4566`):
 ```bash
-# 1. Create KMS Key for Vault Auto-Unseal
-KMS_KEY_ID=$(aws --endpoint-url=http://localhost:4566 kms create-key \
-  --description "Vault Auto-Unseal Key" \
-  --query "KeyMetadata.KeyId" --output text)
+source floci-credentials.env
 
-# 2. Create S3 Bucket for Raft Backups
-aws --endpoint-url=http://localhost:4566 s3 mb s3://vault-backups
+kubectl create secret generic floci-credentials \
+  --from-literal=access-key="$FLOCI_ACCESS_KEY" \
+  --from-literal=secret-key="$FLOCI_SECRET_KEY" \
+  --namespace vault \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl describe secret floci-credentials -n vault
+```
+
+Confirm `access-key` and `secret-key` report non-zero sizes (20 bytes and 40 bytes).
+
+---
+
+### Step 7: Configure the Vault Helm Values File
+
+In Docker on macOS, pods inside the k3s cluster reach Floci directly via its Docker bridge network IP:
+
+```bash
+source floci-credentials.env
+
+# Automatically obtain Floci container IP on Docker network
+FLOCI_CONTAINER_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' floci)
+export FLOCI_POD_ENDPOINT="http://${FLOCI_CONTAINER_IP}:4566"
+
+echo "Using Floci Pod Endpoint: $FLOCI_POD_ENDPOINT"
+echo "Using Floci KMS Key: $FLOCI_KMS_KEY"
+
+sed -i.bak -E \
+  "s|kms_key_id = \"[^\"]*\"|kms_key_id = \"$FLOCI_KMS_KEY\"|" \
+  vault-production-floci.yaml
+
+sed -i.bak \
+  "s|AWS_ENDPOINT_URL: .*|AWS_ENDPOINT_URL: $FLOCI_POD_ENDPOINT|" \
+  vault-production-floci.yaml
+
+sed -i.bak -E \
+  "s|endpoint = \"[^\"]*\"|endpoint = \"$FLOCI_POD_ENDPOINT\"|" \
+  vault-production-floci.yaml
+
+helm template vault hashicorp/vault \
+  --version 0.34.1 \
+  --namespace vault \
+  -f vault-production-floci.yaml >/dev/null
 ```
 
 ---
 
-### Step 8: Deploy HashiCorp Vault 3-Node Raft HA Cluster
-1. **Generate Custom CA & Server TLS Certificates**:
-   ```bash
-   # Create TLS certificates with SANs for internal cluster communication
-   openssl req -x509 -newkey rsa:4096 -days 365 -nodes \
-     -keyout tls/ca.key -out tls/ca.crt -subj "/CN=Vault-Internal-CA"
+### Step 8: Deploy Vault 3-Node Raft HA Cluster
 
-   openssl req -newkey rsa:2048 -nodes \
-     -keyout tls/vault.key -out tls/vault.csr \
-     -subj "/CN=vault.vault.svc.cluster.local"
+```bash
+helm repo add hashicorp https://helm.releases.hashicorp.com
+helm repo update
 
-   openssl x509 -req -in tls/vault.csr -CA tls/ca.crt -CAkey tls/ca.key \
-     -CAcreateserial -out tls/vault.crt -days 365 \
-     -extfile <(printf "subjectAltName=DNS:vault,DNS:vault.vault,DNS:vault.vault.svc.cluster.local,DNS:*.vault-internal,IP:127.0.0.1")
+helm upgrade --install vault hashicorp/vault \
+  --namespace vault \
+  --create-namespace \
+  --version 0.34.1 \
+  -f vault-production-floci.yaml
 
-   # Create Kubernetes secret
-   kubectl create namespace vault
-   kubectl create secret generic vault-tls -n vault \
-     --from-file=ca.crt=tls/ca.crt \
-     --from-file=vault.crt=tls/vault.crt \
-     --from-file=vault.key=tls/vault.key
-   ```
+kubectl get pods -n vault
+```
 
-2. **Deploy Vault Helm Chart with Auto-Unseal**:
-   ```bash
-   helm repo add hashicorp https://helm.releases.hashicorp.com
-   helm repo update
+Wait until all 3 pods (`vault-0`, `vault-1`, `vault-2`) enter the `Running` state:
 
-   helm upgrade --install vault hashicorp/vault \
-     --namespace vault \
-     -f vault-production-floci.yaml
-   ```
-
-3. **Initialize Vault (First Time Only)**:
-   ```bash
-   kubectl exec -n vault vault-0 -- vault operator init \
-     -ca-cert=/vault/userconfig/vault-tls/ca.crt \
-     -key-shares=1 -key-threshold=1 -format=json > vault-init.json
-
-   ROOT_TOKEN=$(jq -r '.root_token' vault-init.json)
-   ```
+```bash
+kubectl wait --for=condition=ContainersReady=false pod/vault-0 -n vault --timeout=60s
+```
 
 ---
 
-### Step 3: Deploy PostgreSQL 18.4
+### Step 9: Initialize and Verify Vault HA Cluster
+
+Auto-unseal handles unsealing automatically; Vault only needs to be initialized once:
+
+```bash
+kubectl exec vault-0 -n vault -- vault status
+
+# Run initialization and save recovery keys and initial root token
+kubectl exec vault-0 -n vault -- \
+  vault operator init -format=json > vault-init.json
+chmod 600 vault-init.json
+
+# Wait for Raft HA synchronization and KMS auto-unseal
+sleep 5
+
+# Check status (should show Initialized: true, Sealed: false, HA Mode: active)
+kubectl exec vault-0 -n vault -- vault status
+
+# Verify Raft peers (requires root token)
+ROOT_TOKEN=$(jq -r '.root_token' vault-init.json)
+kubectl exec vault-0 -n vault -- env VAULT_TOKEN="$ROOT_TOKEN" vault operator raft list-peers
+
+# All pods should now show 1/1 Running
+kubectl get pods -n vault
+```
+
+Expected Raft peers output:
+```
+Node       Address                        State       Voter
+----       -------                        -----       -----
+vault-0    vault-0.vault-internal:8201    leader      true
+vault-1    vault-1.vault-internal:8201    follower    true
+vault-2    vault-2.vault-internal:8201    follower    true
+```
+
+---
+
+### Step 10: Test Secret Operations and HA Failover
+
+```bash
+ROOT_TOKEN=$(jq -r '.root_token' vault-init.json)
+
+# Enable KV v2 secrets engine
+kubectl exec vault-0 -n vault -- env VAULT_TOKEN="$ROOT_TOKEN" vault secrets enable -path=secret kv-v2
+
+# Write a test secret to active leader (vault-0)
+kubectl exec vault-0 -n vault -- env VAULT_TOKEN="$ROOT_TOKEN" vault kv put secret/app config="production-floci" db="postgres"
+
+# Read back from standby follower (vault-1)
+kubectl exec vault-1 -n vault -- env VAULT_TOKEN="$ROOT_TOKEN" vault kv get secret/app
+
+# Test auto-unseal by restarting a follower pod
+kubectl delete pod vault-1 -n vault
+kubectl wait --for=condition=Ready pod/vault-1 -n vault --timeout=60s
+kubectl exec vault-1 -n vault -- vault status
+```
+
+---
+
+### Step 11: Access the Vault UI
+
+```bash
+kubectl port-forward --namespace vault service/vault-ui 8200:8200
+```
+
+Open `https://localhost:8200` in your browser, accept the local TLS certificate, and log in with the `root_token` from `vault-init.json`.
+
+---
+
+## 4. Application & Dynamic Secrets Setup: PostgreSQL, Jaeger & Spring Boot
+
+### Step 12: Deploy PostgreSQL 18.4
+
 Deploy PostgreSQL 18.4 in the `default` namespace:
+
 ```bash
 kubectl apply -f postgres-deployment.yaml
 
 # Wait for PostgreSQL to be ready and initialize the payments schema
+kubectl wait --for=condition=Ready pod -l app=postgres -n default --timeout=60s
 kubectl exec -i deployment/postgres -n default -- psql -U postgres -d payments < scripts/schema.sql
 ```
 
 ---
 
-### Step 4: Deploy Jaeger Distributed Tracing
+### Step 13: Deploy Jaeger Distributed Tracing
+
 Deploy Jaeger All-In-One to collect and visualize OpenTelemetry traces:
+
 ```bash
 kubectl apply -f k8s/jaeger-deployment.yaml
+kubectl wait --for=condition=Ready pod -l app=jaeger -n default --timeout=60s
 ```
 
 ---
 
-### Step 5: Configure Vault with Secret-Less Kubernetes Auth & Dynamic DB Engine
+### Step 14: Configure Vault Secret-Less Kubernetes Auth & Dynamic DB Engine
+
 Run the automated configuration script:
+
 ```bash
 ./scripts/k8s-vault-setup.sh
 ```
 
 What this script automates:
-1. **Enables Audit Logging**: Cryptographic logging to `/vault/data/vault_audit.log`.
+1. **Enables Audit Logging**: Cryptographic HMAC logging to `/vault/data/vault_audit.log`.
 2. **Configures Database Engine**: Connects `database/config/payments` to `postgres.default.svc.cluster.local:5432/payments`.
-3. **Creates Dynamic DB Role**: `payments-app` with 1m default / 2m max TTL.
+3. **Creates Dynamic DB Roles**:
+   - `payments-app`: Demo role (1m default / 2m max TTL).
+   - `payments-app-prod`: Production role (1h default / 24h max TTL).
 4. **Enables Kubernetes Auth (`auth/kubernetes`)**: Points to `https://kubernetes.default.svc:443`.
 5. **Binds ServiceAccount**: Maps ServiceAccount `vault-dynamic-secrets` in namespace `default` to policy `payments-app-policy`.
+6. **Configures AppRole Auth**: Role ID & Secret ID as backup authentication mechanism.
 
 ---
 
-### Step 6: Create Java TLS Truststore & Deploy Application
+### Step 15: Create Java TLS Truststore & Deploy Application
+
 1. **Generate JKS Truststore for Spring Boot**:
    ```bash
    keytool -import -trustcacerts -noprompt -alias vault-ca \
      -file tls/ca.crt -keystore tls/vault-truststore.jks -storepass changeit
 
    kubectl create secret generic vault-truststore \
-     --from-file=vault-truststore.jks=tls/vault-truststore.jks -n default
+     --from-file=vault-truststore.jks=tls/vault-truststore.jks \
+     -n default \
+     --dry-run=client -o yaml | kubectl apply -f -
    ```
 
 2. **Build and Load Docker Image into Cluster**:
@@ -401,11 +485,12 @@ What this script automates:
 3. **Apply Kubernetes Deployment**:
    ```bash
    kubectl apply -f k8s/deployment.yaml
+   kubectl rollout status deployment/vault-dynamic-secrets -n default --timeout=90s
    ```
 
 ---
 
-## 3. Secret-Less Kubernetes Authentication vs. AppRole
+## 5. Secret-Less Kubernetes Authentication vs. AppRole
 
 | Feature | Kubernetes Native Auth *(Active)* | AppRole Auth *(Fallback)* |
 |---|---|---|
@@ -416,7 +501,7 @@ What this script automates:
 
 ---
 
-## 4. Production TTL Tuning vs. Demo TTL Tuning
+## 6. Production TTL Tuning vs. Demo TTL Tuning
 
 To change from Demo TTL (1m/2m) to Production TTL (1h/24h):
 
@@ -435,7 +520,7 @@ To activate production settings in Kubernetes, set `SPRING_PROFILES_ACTIVE: "pro
 
 ---
 
-## 5. Observability, Telemetry & Tracing Runbook
+## 7. Observability, Telemetry & Tracing Runbook
 
 ### 1. View Live Dynamic Credential Telemetry (`/actuator/vaultLease`):
 ```bash
@@ -478,3 +563,44 @@ INFO [vault-dynamic-secrets,traceId,spanId] : 🔄 [VAULT DYNAMIC CREDS ROTATION
 kubectl exec -n vault vault-0 -- tail -f /vault/data/vault_audit.log
 ```
 Every token login, dynamic secret lease issuance, and revocation is recorded with cryptographic HMAC hashing.
+
+---
+
+## 8. Troubleshooting
+
+| Symptom | Cause and resolution |
+|---|---|
+| `dial tcp: lookup host.docker.internal: no such host` | k3s in-cluster CoreDNS does not resolve `host.docker.internal`. Set `FLOCI_POD_ENDPOINT` to the Floci container IP (`docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' floci`) as described in step 7. |
+| `InvalidClientTokenId` from `aws` | The shell is using real or invalid AWS credentials. Re-export the Floci variables from step 2. |
+| `localhost:8080: connect: connection refused` | `kubectl` has no valid context. Re-run `aws eks update-kubeconfig` from step 3. |
+| `secret tls-server not found` or `secret tls-ca not found` | Run step 4 before Helm deployment. |
+| `NoCredentialProviders` | The `floci-credentials` Secret has empty values or is missing. Repeat steps 5 and 6, then run `kubectl rollout restart statefulset/vault -n vault`. |
+| `permission denied` on `vault operator raft list-peers` | Authenticate using the root token: `kubectl exec vault-0 -n vault -- env VAULT_TOKEN="$ROOT_TOKEN" vault operator raft list-peers`. |
+| Helm schema error for `extraSecretEnvironmentVars` | Use the supplied values file. It must be a YAML list with `envName`, `secretName`, and `secretKey`. |
+
+---
+
+## 9. Cleanup
+
+```bash
+# Application teardown
+kubectl delete -f k8s/deployment.yaml -n default --ignore-not-found
+kubectl delete -f k8s/jaeger-deployment.yaml -n default --ignore-not-found
+kubectl delete -f postgres-deployment.yaml -n default --ignore-not-found
+
+# Vault and Infrastructure teardown
+helm uninstall vault -n vault --ignore-not-found
+kubectl delete namespace vault --ignore-not-found
+aws eks delete-cluster --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+docker compose -f docker-compose-floci.yml down
+```
+
+---
+
+## 10. References
+
+- [Floci EKS documentation](https://floci.io/floci/services/eks/)
+- [HashiCorp Vault Helm chart documentation](https://developer.hashicorp.com/vault/docs/platform/k8s/helm)
+- [Vault AWS KMS seal documentation](https://developer.hashicorp.com/vault/docs/configuration/seal/awskms)
+- [Vault Raft integrated storage](https://developer.hashicorp.com/vault/docs/configuration/storage/raft)
+- [Spring Cloud Vault Documentation](https://cloud.spring.io/spring-cloud-vault/)
