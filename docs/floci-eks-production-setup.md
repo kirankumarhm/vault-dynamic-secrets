@@ -461,7 +461,7 @@ sed -i.bak \
   vault-production-floci.yaml
 
 sed -i.bak -E \
-  "s|endpoint = \"[^\"]*\"|endpoint = \"$FLOCI_POD_ENDPOINT\"|" \
+  "s|endpoint[[:space:]]*=[[:space:]]*\"[^\"]*\"|endpoint   = \"$FLOCI_POD_ENDPOINT\"|" \
   vault-production-floci.yaml
 
 helm template vault hashicorp/vault \
