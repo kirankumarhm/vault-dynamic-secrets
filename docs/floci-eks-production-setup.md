@@ -93,6 +93,13 @@ EKS needs an IAM role to manage resources on your behalf.
 2.2 Create the role and attach the required AWS managed policy:
 
 ```bash
+
+export AWS_ENDPOINT_URL=http://localhost:4566
+export AWS_DEFAULT_REGION=us-east-1
+export AWS_ACCESS_KEY_ID=test
+export AWS_SECRET_ACCESS_KEY=test
+
+
 aws iam create-role \
   --role-name EKSClusterRole \
   --assume-role-policy-document file://cluster-trust-policy.json
