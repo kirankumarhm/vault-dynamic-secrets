@@ -616,7 +616,10 @@ What this script automates:
 
 1. **Generate JKS Truststore for Spring Boot**:
    ```bash
-   keytool -import -trustcacerts -noprompt -alias vault-ca \
+
+   # On macOS, /usr/bin/keytool is a stub — resolve the real binary via JAVA_HOME
+   JAVA_HOME=$(/usr/libexec/java_home)
+   "${JAVA_HOME}/bin/keytool" -import -trustcacerts -noprompt -alias vault-ca \
      -file tls/ca.crt -keystore tls/vault-truststore.jks -storepass changeit
 
    kubectl create secret generic vault-truststore \
