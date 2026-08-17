@@ -88,7 +88,7 @@ server:
         seal "awskms" {
           region     = "us-east-1"
           kms_key_id = "FLOCI_KMS_KEY_PLACEHOLDER"
-          endpoint   = "http://127.0.0.1:4566"
+          endpoint   = "FLOCI_POD_ENDPOINT_PLACEHOLDER"
           skip_region_validation = true
         }
 
@@ -103,7 +103,7 @@ server:
     
     # Floci/AWS Configuration
     AWS_REGION: us-east-1
-    AWS_ENDPOINT_URL: http://127.0.0.1:4566
+    AWS_ENDPOINT_URL: FLOCI_POD_ENDPOINT_PLACEHOLDER
     
     # For SDK compatibility
     AWS_DEFAULT_REGION: us-east-1
