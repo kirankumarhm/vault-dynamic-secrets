@@ -596,6 +596,7 @@ kubectl wait --for=condition=Ready pod -l app=jaeger -n default --timeout=60s
 Run the automated configuration script:
 
 ```bash
+export VAULT_TOKEN=$(jq -r '.root_token' vault-init.json)
 ./scripts/k8s-vault-setup.sh
 ```
 
