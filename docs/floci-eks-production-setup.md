@@ -72,7 +72,217 @@ graph TB
 
 ## 2. Step-by-Step Production Setup
 
-### Step 1: Floci AWS Emulator & KMS Auto-Unseal Key
+### Step 1: Create the EKS Cluster Role
+EKS needs an IAM role to manage resources on your behalf.
+
+2.1 Create a trust policy (save as `cluster-trust-policy.json`):
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "eks.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+```
+2.2 Create the role and attach the required AWS managed policy:
+
+```bash
+aws iam create-role \
+  --role-name EKSClusterRole \
+  --assume-role-policy-document file://cluster-trust-policy.json
+
+aws iam attach-role-policy \
+  --role-name EKSClusterRole \
+  --policy-arn arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+```
+
+
+### Step 2: Create the EKS Cluster
+Replace the subnet IDs with the subnets from your VPC. This process takes about 10-15 minutes to complete.
+```bash
+aws eks create-cluster \
+  --name vault-cluster \
+  --region us-east-1 \
+  --role-arn arn:aws:iam::YOUR_ACCOUNT_ID:role/EKSClusterRole \
+  --resources-vpc-config subnetIds=subnet-12345,subnet-67890
+```
+Wait for the cluster status to become ACTIVE before proceeding. You can check the status with:
+
+```bash
+aws eks describe-cluster --name vault-cluster --query "cluster.status"
+```
+
+### Step 3: Create the Node Group
+The EC2 instances (nodes) running your containers also need an IAM role.
+3.1 Create the node trust policy (save as `node-trust-policy.json`):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "ec2.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+```
+
+3.2 Create the role and attach the necessary node policies:
+
+```bash
+aws iam create-role \
+  --role-name EKSNodeRole \
+  --assume-role-policy-document file://node-trust-policy.json
+
+aws iam attach-role-policy \
+  --role-name EKSNodeRole \
+  --policy-arn arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+
+aws iam attach-role-policy \
+  --role-name EKSNodeRole \
+  --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+
+aws iam attach-role-policy \
+  --role-name EKSNodeRole \
+  --policy-arn arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+```
+
+3.3 Create the managed node group:
+
+```bash
+aws eks create-nodegroup \
+  --cluster-name vault-cluster \
+  --nodegroup-name standard-workers \
+  --node-role arn:aws:iam::YOUR_ACCOUNT_ID:role/EKSNodeRole \
+  --subnets subnet-12345 subnet-67890 \
+  --instance-types t3.medium \
+  --scaling-config minSize=1,maxSize=4,desiredSize=3
+```
+
+### Step 4: Register the OIDC Provider for the Cluster
+To map AWS IAM roles to Kubernetes service accounts (IRSA), you must register the cluster's OIDC issuer with AWS IAM.
+4.1 Get the OIDC Issuer URL:
+
+```bash
+aws eks describe-cluster \
+  --name vault-cluster \
+  --query "cluster.identity.oidc.issuer" \
+  --output text
+```
+
+(Example output: [https://oidc.eks.us-east-1.amazonaws.com/id/EXAMPLED539D4633E53E51EXAMPLE](https://oidc.eks.us-east-1.amazonaws.com/id/EXAMPLED539D4633E53E51EXAMPLE))
+4.2 Create the IAM OIDC Provider:
+(Note: 9e99a48a9960b14926bb7f3b02e22da2b0ab7280 is the standard AWS root CA thumbprint for EKS OIDC).
+
+```bash
+aws iam create-open-id-connect-provider \
+  --url <YOUR_OIDC_ISSUER_URL> \
+  --client-id-list "sts.amazonaws.com" \
+  --thumbprint-list "9e99a48a9960b14926bb7f3b02e22da2b0ab7280"
+```
+
+### Step 5: Create the Vault IAM Role (IRSA)
+Now, create the role that Vault will actually use.
+5.1 Create the Vault IAM Policy (save as vault-policy.json):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:DescribeKey"
+      ],
+      "Resource": "arn:aws:kms:us-east-1:YOUR_ACCOUNT_ID:key/YOUR_KMS_KEY_ID"
+    }
+  ]
+}
+```
+
+```bash
+aws iam create-policy \
+  --policy-name VaultKMSUnsealPolicy \
+  --policy-document file://vault-policy.json
+```
+
+5.2 Create the IRSA Trust Policy (save as vault-irsa-trust.json).
+You must replace the OIDC_ID (the string of numbers/letters at the end of your issuer URL) and YOUR_ACCOUNT_ID.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::YOUR_ACCOUNT_ID:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/YOUR_OIDC_ID"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "oidc.eks.us-east-1.amazonaws.com/id/YOUR_OIDC_ID:aud": "sts.amazonaws.com",
+          "oidc.eks.us-east-1.amazonaws.com/id/YOUR_OIDC_ID:sub": "system:serviceaccount:vault:vault"
+        }
+      }
+    }
+  ]
+}
+```
+
+5.3 Create the role and attach the policy:
+'''bash
+aws iam create-role \
+  --role-name VaultEksRole \
+  --assume-role-policy-document file://vault-irsa-trust.json
+
+aws iam attach-role-policy \
+  --role-name VaultEksRole \
+  --policy-arn arn:aws:iam::YOUR_ACCOUNT_ID:policy/VaultKMSUnsealPolicy
+```
+
+### Step 6: Link the AWS Role to Kubernetes
+Finally, update your local kubeconfig and create the Kubernetes Service Account annotated with your new AWS role.
+
+```bash
+# Update local kubeconfig
+aws eks update-kubeconfig --region us-east-1 --name vault-cluster
+
+# Create the namespace
+kubectl create namespace vault
+
+# Create the service account with the AWS IAM role annotation
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vault
+  namespace: vault
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::YOUR_ACCOUNT_ID:role/VaultEksRole
+EOF
+```
+
+
+
+
+
+
+
+
+### Step 7: Floci AWS Emulator & KMS Auto-Unseal Key
 Ensure Floci is running locally (`http://localhost:4566`):
 ```bash
 # 1. Create KMS Key for Vault Auto-Unseal
@@ -86,7 +296,7 @@ aws --endpoint-url=http://localhost:4566 s3 mb s3://vault-backups
 
 ---
 
-### Step 2: Deploy HashiCorp Vault 3-Node Raft HA Cluster
+### Step 8: Deploy HashiCorp Vault 3-Node Raft HA Cluster
 1. **Generate Custom CA & Server TLS Certificates**:
    ```bash
    # Create TLS certificates with SANs for internal cluster communication
