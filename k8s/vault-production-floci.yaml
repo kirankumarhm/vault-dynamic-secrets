@@ -1,0 +1,169 @@
+# ============================================================
+# Production-Shaped Vault on Floci
+# Auto-Unseal via Floci KMS + Automated Backups to S3
+# ============================================================
+
+global:
+  enabled: true
+  tlsDisable: false
+
+serviceName: vault-internal
+
+server:
+  image:
+    repository: hashicorp/vault
+    tag: "1.18.2"
+    pullPolicy: IfNotPresent
+
+  # Production-sized resources (reasonable for development Mac)
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+  dataStorage:
+    enabled: true
+    size: 256Mi
+    storageClass: ""
+
+  auditStorage:
+    enabled: true
+    size: 128Mi
+    storageClass: ""
+
+  standalone:
+    enabled: false
+
+  ha:
+    enabled: true
+    replicas: 3
+    raft:
+      enabled: true
+      setNodeId: true
+
+      config: |
+        ui = true
+        cluster_name = "vault-kubernetes-production-floci"
+
+        listener "tcp" {
+          address            = "[::]:8200"
+          cluster_address    = "[::]:8201"
+          tls_cert_file      = "/vault/userconfig/tls-server/tls.crt"
+          tls_key_file       = "/vault/userconfig/tls-server/tls.key"
+          tls_client_ca_file = "/vault/userconfig/tls-ca/ca.crt"
+        }
+
+        storage "raft" {
+          path = "/vault/data"
+          retain_logs = 7
+          snapshot_threshold = 16384
+          trailing_logs = 0
+
+          retry_join {
+            leader_api_addr = "https://vault-0.vault-internal:8200"
+            leader_ca_cert_file = "/vault/userconfig/tls-ca/ca.crt"
+            leader_client_cert_file = "/vault/userconfig/tls-server/tls.crt"
+            leader_client_key_file = "/vault/userconfig/tls-server/tls.key"
+          }
+          retry_join {
+            leader_api_addr = "https://vault-1.vault-internal:8200"
+            leader_ca_cert_file = "/vault/userconfig/tls-ca/ca.crt"
+            leader_client_cert_file = "/vault/userconfig/tls-server/tls.crt"
+            leader_client_key_file = "/vault/userconfig/tls-server/tls.key"
+          }
+          retry_join {
+            leader_api_addr = "https://vault-2.vault-internal:8200"
+            leader_ca_cert_file = "/vault/userconfig/tls-ca/ca.crt"
+            leader_client_cert_file = "/vault/userconfig/tls-server/tls.crt"
+            leader_client_key_file = "/vault/userconfig/tls-server/tls.key"
+          }
+        }
+
+        # ============================================================
+        # AUTO-UNSEAL via FLOCI KMS
+        # ============================================================
+        seal "awskms" {
+          region     = "us-east-1"
+          kms_key_id = "FLOCI_KMS_KEY_PLACEHOLDER"
+          endpoint   = "http://127.0.0.1:4566"
+          skip_region_validation = true
+        }
+
+        service_registration "kubernetes" {}
+
+  # ============================================================
+  # ENVIRONMENT VARIABLES FOR AUTO-UNSEAL
+  # ============================================================
+  extraEnvironmentVars:
+    # TLS Configuration
+    VAULT_CACERT: /vault/userconfig/tls-ca/ca.crt
+    
+    # Floci/AWS Configuration
+    AWS_REGION: us-east-1
+    AWS_ENDPOINT_URL: http://127.0.0.1:4566
+    
+    # For SDK compatibility
+    AWS_DEFAULT_REGION: us-east-1
+
+  # ============================================================
+  # AWS CREDENTIALS FROM KUBERNETES SECRET
+  # ============================================================
+  extraSecretEnvironmentVars:
+    - envName: AWS_ACCESS_KEY_ID
+      secretName: floci-credentials
+      secretKey: access-key
+    - envName: AWS_SECRET_ACCESS_KEY
+      secretName: floci-credentials
+      secretKey: secret-key
+
+  extraVolumes:
+    - type: secret
+      name: tls-server
+    - type: secret
+      name: tls-ca
+
+  # Health probes with tuning
+  readinessProbe:
+    enabled: true
+    path: "/v1/sys/health?standbyok=true&sealedcode=503&uninitcode=501"
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+  livenessProbe:
+    enabled: false
+
+  # Audit logging
+  audit:
+    file:
+      enabled: true
+
+  # Pod affinity
+  affinity: ""
+
+# ============================================================
+# UI CONFIGURATION
+# ============================================================
+ui:
+  enabled: true
+  serviceType: ClusterIP
+  externalPort: 8200
+
+# ============================================================
+# VAULT AGENT INJECTOR
+# ============================================================
+injector:
+  enabled: true
+  replicas: 1
+  
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
