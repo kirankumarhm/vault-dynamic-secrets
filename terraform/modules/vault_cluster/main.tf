@@ -1,19 +1,15 @@
 # ==============================================================================
-# Helm Release: HashiCorp Vault 3-Node Raft HA Cluster
+# Module: modules/vault_cluster
+# Purpose: Deploys 3-Node Raft High-Availability HashiCorp Vault Helm release
+#          with AWS KMS Auto-Unseal, mTLS, and File Audit Logging.
 # ==============================================================================
+
 resource "helm_release" "vault" {
   name       = "vault"
   repository = "https://helm.releases.hashicorp.com"
   chart      = "vault"
   version    = var.vault_helm_version
-  namespace  = kubernetes_namespace.vault.metadata[0].name
-
-  depends_on = [
-    kubernetes_secret.tls_ca,
-    kubernetes_secret.tls_server,
-    kubernetes_secret.floci_credentials,
-    aws_kms_key.vault_unseal
-  ]
+  namespace  = var.vault_namespace
 
   values = [
     yamlencode({
@@ -64,9 +60,9 @@ resource "helm_release" "vault" {
               listener "tcp" {
                 address            = "[::]:8200"
                 cluster_address    = "[::]:8201"
-                tls_cert_file      = "/vault/userconfig/tls-server/tls.crt"
-                tls_key_file       = "/vault/userconfig/tls-server/tls.key"
-                tls_client_ca_file = "/vault/userconfig/tls-ca/ca.crt"
+                tls_cert_file      = "/vault/userconfig/${var.tls_server_secret_name}/tls.crt"
+                tls_key_file       = "/vault/userconfig/${var.tls_server_secret_name}/tls.key"
+                tls_client_ca_file = "/vault/userconfig/${var.tls_ca_secret_name}/ca.crt"
               }
 
               storage "raft" {
@@ -77,27 +73,27 @@ resource "helm_release" "vault" {
 
                 retry_join {
                   leader_api_addr = "https://vault-0.vault-internal:8200"
-                  leader_ca_cert_file = "/vault/userconfig/tls-ca/ca.crt"
-                  leader_client_cert_file = "/vault/userconfig/tls-server/tls.crt"
-                  leader_client_key_file = "/vault/userconfig/tls-server/tls.key"
+                  leader_ca_cert_file = "/vault/userconfig/${var.tls_ca_secret_name}/ca.crt"
+                  leader_client_cert_file = "/vault/userconfig/${var.tls_server_secret_name}/tls.crt"
+                  leader_client_key_file = "/vault/userconfig/${var.tls_server_secret_name}/tls.key"
                 }
                 retry_join {
                   leader_api_addr = "https://vault-1.vault-internal:8200"
-                  leader_ca_cert_file = "/vault/userconfig/tls-ca/ca.crt"
-                  leader_client_cert_file = "/vault/userconfig/tls-server/tls.crt"
-                  leader_client_key_file = "/vault/userconfig/tls-server/tls.key"
+                  leader_ca_cert_file = "/vault/userconfig/${var.tls_ca_secret_name}/ca.crt"
+                  leader_client_cert_file = "/vault/userconfig/${var.tls_server_secret_name}/tls.crt"
+                  leader_client_key_file = "/vault/userconfig/${var.tls_server_secret_name}/tls.key"
                 }
                 retry_join {
                   leader_api_addr = "https://vault-2.vault-internal:8200"
-                  leader_ca_cert_file = "/vault/userconfig/tls-ca/ca.crt"
-                  leader_client_cert_file = "/vault/userconfig/tls-server/tls.crt"
-                  leader_client_key_file = "/vault/userconfig/tls-server/tls.key"
+                  leader_ca_cert_file = "/vault/userconfig/${var.tls_ca_secret_name}/ca.crt"
+                  leader_client_cert_file = "/vault/userconfig/${var.tls_server_secret_name}/tls.crt"
+                  leader_client_key_file = "/vault/userconfig/${var.tls_server_secret_name}/tls.key"
                 }
               }
 
               seal "awskms" {
                 region                 = "${var.aws_region}"
-                kms_key_id             = "${aws_kms_key.vault_unseal.key_id}"
+                kms_key_id             = "${var.kms_key_id}"
                 endpoint               = "${var.use_floci ? var.floci_pod_kms_endpoint : ""}"
                 skip_region_validation = ${var.use_floci}
               }
@@ -107,7 +103,7 @@ resource "helm_release" "vault" {
           }
         }
         extraEnvironmentVars = {
-          VAULT_CACERT       = "/vault/userconfig/tls-ca/ca.crt"
+          VAULT_CACERT       = "/vault/userconfig/${var.tls_ca_secret_name}/ca.crt"
           AWS_REGION         = var.aws_region
           AWS_DEFAULT_REGION = var.aws_region
           AWS_ENDPOINT_URL   = var.use_floci ? var.floci_pod_kms_endpoint : ""
@@ -115,23 +111,23 @@ resource "helm_release" "vault" {
         extraSecretEnvironmentVars = [
           {
             envName    = "AWS_ACCESS_KEY_ID"
-            secretName = "floci-credentials"
+            secretName = var.credentials_secret_name
             secretKey  = "access-key"
           },
           {
             envName    = "AWS_SECRET_ACCESS_KEY"
-            secretName = "floci-credentials"
+            secretName = var.credentials_secret_name
             secretKey  = "secret-key"
           }
         ]
         extraVolumes = [
           {
             type = "secret"
-            name = "tls-server"
+            name = var.tls_server_secret_name
           },
           {
             type = "secret"
-            name = "tls-ca"
+            name = var.tls_ca_secret_name
           }
         ]
         readinessProbe = {

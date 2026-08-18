@@ -1,19 +1,19 @@
 # ==============================================================================
-# Namespace: vault
+# Module: modules/tls_pki
+# Purpose: Automatically generates private Root CA and signed x509 Server
+#          Certificates with SANs for Vault mTLS clustering and HTTPS listeners.
 # ==============================================================================
+
 resource "kubernetes_namespace" "vault" {
   metadata {
     name = var.vault_namespace
     labels = {
-      "app.kubernetes.io/name"    = "vault"
+      "app.kubernetes.io/name"     = "vault"
       "app.kubernetes.io/instance" = "vault"
+      "environment"                = var.environment
     }
   }
 }
-
-# ==============================================================================
-# Automated mTLS Certificate Authority & Server Certificates
-# ==============================================================================
 
 # 1. Private Root CA
 resource "tls_private_key" "ca_key" {
@@ -25,7 +25,7 @@ resource "tls_self_signed_cert" "ca_cert" {
   private_key_pem = tls_private_key.ca_key.private_key_pem
 
   subject {
-    common_name  = "Vault-Internal-Production-CA"
+    common_name  = "Vault-Internal-${var.environment}-CA"
     organization = "HashiCorp Vault Production"
   }
 
@@ -40,7 +40,7 @@ resource "tls_self_signed_cert" "ca_cert" {
   ]
 }
 
-# 2. Vault Server TLS Certificate with SANs
+# 2. Vault Server TLS Certificate with SANs for Raft and Services
 resource "tls_private_key" "vault_key" {
   algorithm = "RSA"
   rsa_bits  = 2048
@@ -50,15 +50,15 @@ resource "tls_cert_request" "vault_csr" {
   private_key_pem = tls_private_key.vault_key.private_key_pem
 
   subject {
-    common_name  = "vault.vault.svc.cluster.local"
+    common_name  = "vault.${var.vault_namespace}.svc.cluster.local"
     organization = "HashiCorp Vault Production"
   }
 
   dns_names = [
     "vault",
-    "vault.vault",
-    "vault.vault.svc",
-    "vault.vault.svc.cluster.local",
+    "vault.${var.vault_namespace}",
+    "vault.${var.vault_namespace}.svc",
+    "vault.${var.vault_namespace}.svc.cluster.local",
     "*.vault-internal",
     "vault-0.vault-internal",
     "vault-1.vault-internal",

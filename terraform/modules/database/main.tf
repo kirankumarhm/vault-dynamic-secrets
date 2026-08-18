@@ -1,19 +1,19 @@
 # ==============================================================================
-# Database Provisioning: Amazon RDS (Real AWS) vs. In-Cluster Database (Floci)
+# Module: modules/database
+# Purpose: Provisions Amazon RDS PostgreSQL (for AWS Production) or automated
+#          in-cluster PostgreSQL with schema initialization (for Floci/Local).
 # ==============================================================================
 
 locals {
-  postgres_host = var.use_floci ? "postgres.default.svc.cluster.local" : (
-    length(aws_db_instance.postgres) > 0 ? aws_db_instance.postgres[0].address : var.postgres_host
+  postgres_host = var.use_floci ? "postgres.${var.app_namespace}.svc.cluster.local" : (
+    length(aws_db_instance.postgres) > 0 ? aws_db_instance.postgres[0].address : "localhost"
   )
 }
 
-# ==============================================================================
-# 1. REAL AWS PRODUCTION: Amazon RDS PostgreSQL (Multi-AZ with KMS Encryption)
-# ==============================================================================
+# 1. Real AWS Production: Amazon RDS PostgreSQL (Multi-AZ with KMS Encryption)
 resource "aws_db_instance" "postgres" {
   count                  = var.use_floci ? 0 : 1
-  identifier             = "payments-db-production"
+  identifier             = "payments-db-${var.environment}"
   engine                 = "postgres"
   engine_version         = "16.3"
   instance_class         = "db.t4g.medium"
@@ -21,7 +21,7 @@ resource "aws_db_instance" "postgres" {
   max_allocated_storage  = 100
   storage_type           = "gp3"
   storage_encrypted      = true
-  kms_key_id             = aws_kms_key.vault_unseal.arn
+  kms_key_id             = var.kms_key_arn
 
   db_name                = var.postgres_db
   username               = var.postgres_admin_user
@@ -33,27 +33,23 @@ resource "aws_db_instance" "postgres" {
   skip_final_snapshot    = true
   deletion_protection    = false
 
-  backup_retention_period = 7
+  backup_retention_period    = 7
   auto_minor_version_upgrade = true
 
   tags = {
-    Environment = "production"
+    Environment = var.environment
     ManagedBy   = "Terraform"
     Application = "payments-service"
   }
 }
 
-# ==============================================================================
-# 2. LOCAL FLOCI / KUBERNETES EMULATION: Automated In-Cluster PostgreSQL
-# ==============================================================================
-
-# ConfigMap with initial database schema mounted directly into docker-entrypoint-initdb.d
+# 2. Local Floci / Kubernetes Emulation: In-Cluster PostgreSQL with Schema ConfigMap
 resource "kubernetes_config_map" "postgres_schema" {
   count = var.use_floci ? 1 : 0
 
   metadata {
     name      = "postgres-schema"
-    namespace = "default"
+    namespace = var.app_namespace
   }
 
   data = {
@@ -71,13 +67,12 @@ resource "kubernetes_config_map" "postgres_schema" {
   }
 }
 
-# PostgreSQL Kubernetes Deployment
 resource "kubernetes_deployment" "postgres" {
   count = var.use_floci ? 1 : 0
 
   metadata {
     name      = "postgres"
-    namespace = "default"
+    namespace = var.app_namespace
     labels = {
       app = "postgres"
     }
@@ -106,7 +101,7 @@ resource "kubernetes_deployment" "postgres" {
           image_pull_policy = "IfNotPresent"
 
           port {
-            container_port = 5432
+            container_port = var.postgres_port
           }
 
           env {
@@ -151,13 +146,12 @@ resource "kubernetes_deployment" "postgres" {
   }
 }
 
-# PostgreSQL ClusterIP Service
 resource "kubernetes_service" "postgres" {
   count = var.use_floci ? 1 : 0
 
   metadata {
     name      = "postgres"
-    namespace = "default"
+    namespace = var.app_namespace
     labels = {
       app = "postgres"
     }
@@ -172,8 +166,8 @@ resource "kubernetes_service" "postgres" {
 
     port {
       name        = "postgres"
-      port        = 5432
-      target_port = 5432
+      port        = var.postgres_port
+      target_port = var.postgres_port
     }
   }
 }

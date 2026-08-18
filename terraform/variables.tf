@@ -1,6 +1,12 @@
+variable "environment" {
+  type        = string
+  description = "Deployment environment (e.g. prod, staging, dev)."
+  default     = "prod"
+}
+
 variable "use_floci" {
   type        = bool
-  description = "Set to true when running on local Floci emulator; set to false for real AWS EKS production."
+  description = "Set to true when running on local Floci emulator; set to false for real AWS EKS & RDS production."
   default     = true
 }
 
@@ -10,9 +16,15 @@ variable "floci_endpoint" {
   default     = "http://localhost:4566"
 }
 
+variable "floci_pod_kms_endpoint" {
+  type        = string
+  description = "Endpoint accessible from within the Kubernetes pod network to reach Floci KMS."
+  default     = "http://127.0.0.1:4566"
+}
+
 variable "aws_region" {
   type        = string
-  description = "AWS Region for KMS, EKS, and S3 resources."
+  description = "AWS Region for KMS, EKS, RDS, and S3 resources."
   default     = "us-east-1"
 }
 
@@ -89,10 +101,16 @@ variable "vault_skip_tls_verify" {
   default     = true
 }
 
-variable "postgres_host" {
+variable "app_namespace" {
   type        = string
-  description = "PostgreSQL hostname in Kubernetes or AWS RDS endpoint."
-  default     = "postgres.default.svc.cluster.local"
+  description = "Kubernetes namespace where the application workload runs."
+  default     = "default"
+}
+
+variable "app_service_account_name" {
+  type        = string
+  description = "Kubernetes ServiceAccount name for application authentication."
+  default     = "vault-dynamic-secrets"
 }
 
 variable "postgres_port" {
@@ -118,10 +136,4 @@ variable "postgres_admin_password" {
   description = "PostgreSQL master admin password."
   default     = "postgrespassword"
   sensitive   = true
-}
-
-variable "floci_pod_kms_endpoint" {
-  type        = string
-  description = "Endpoint accessible from within the Kubernetes pod network to reach Floci KMS."
-  default     = "http://127.0.0.1:4566"
 }

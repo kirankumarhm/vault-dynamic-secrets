@@ -1,8 +1,11 @@
 # ==============================================================================
-# IAM Policy: Least-Privilege Permissions for Vault Auto-Unseal & S3 Backups
+# Module: modules/iam_auth
+# Purpose: Manages least-privilege IAM policies, IAM users, and Kubernetes Secret
+#          containing AWS credentials for Vault Auto-Unseal and S3 Backups.
 # ==============================================================================
+
 resource "aws_iam_policy" "vault_unseal_policy" {
-  name        = "vault-autounseal-policy-prod"
+  name        = "vault-autounseal-policy-${var.environment}"
   description = "Allows Vault to perform KMS auto-unseal operations and manage S3 backups"
 
   policy = jsonencode({
@@ -17,7 +20,7 @@ resource "aws_iam_policy" "vault_unseal_policy" {
           "kms:DescribeKey",
           "kms:GenerateDataKey"
         ]
-        Resource = aws_kms_key.vault_unseal.arn
+        Resource = var.kms_key_arn
       },
       {
         Sid    = "VaultS3Backups"
@@ -28,21 +31,18 @@ resource "aws_iam_policy" "vault_unseal_policy" {
           "s3:ListBucket"
         ]
         Resource = [
-          aws_s3_bucket.vault_backups.arn,
-          "${aws_s3_bucket.vault_backups.arn}/*"
+          var.s3_bucket_arn,
+          "${var.s3_bucket_arn}/*"
         ]
       }
     ]
   })
 }
 
-# ==============================================================================
-# IAM User & Access Key (Emulates IRSA / IAM credentials for Vault Pod)
-# ==============================================================================
 resource "aws_iam_user" "vault_unseal" {
-  name = "vault-autounseal-prod"
+  name = "vault-autounseal-${var.environment}"
   tags = {
-    Environment = "production"
+    Environment = var.environment
     ManagedBy   = "Terraform"
   }
 }
@@ -56,11 +56,10 @@ resource "aws_iam_access_key" "vault_unseal_key" {
   user = aws_iam_user.vault_unseal.name
 }
 
-# Injects the AWS Credentials into the Kubernetes Secret in namespace 'vault'
 resource "kubernetes_secret" "floci_credentials" {
   metadata {
     name      = "floci-credentials"
-    namespace = kubernetes_namespace.vault.metadata[0].name
+    namespace = var.vault_namespace
   }
 
   data = {

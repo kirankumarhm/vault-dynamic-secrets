@@ -1,3 +1,4 @@
+environment        = "prod"
 use_floci          = true
 floci_endpoint     = "http://localhost:4566"
 aws_region         = "us-east-1"
@@ -6,7 +7,8 @@ vault_namespace    = "vault"
 vault_helm_version = "0.34.1"
 vault_image_tag    = "1.18.2"
 vault_replicas     = 3
-postgres_host      = "postgres.default.svc.cluster.local"
+app_namespace      = "default"
+app_service_account_name = "vault-dynamic-secrets"
 postgres_port      = 5432
 postgres_db        = "payments"
 postgres_admin_user = "postgres"
