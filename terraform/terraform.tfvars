@@ -1,0 +1,13 @@
+use_floci          = true
+floci_endpoint     = "http://localhost:4566"
+aws_region         = "us-east-1"
+eks_cluster_name   = "vault-floci"
+vault_namespace    = "vault"
+vault_helm_version = "0.34.1"
+vault_image_tag    = "1.18.2"
+vault_replicas     = 3
+postgres_host      = "postgres.default.svc.cluster.local"
+postgres_port      = 5432
+postgres_db        = "payments"
+postgres_admin_user = "postgres"
+postgres_admin_password = "postgrespassword"

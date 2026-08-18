@@ -5,3 +5,8 @@ vault.env
 .DS_Store
 .idea/
 *.iml
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+
