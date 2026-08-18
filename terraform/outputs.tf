@@ -22,3 +22,9 @@ output "vault_helm_status" {
   description = "Status of the Vault Helm release"
   value       = helm_release.vault.status
 }
+
+output "postgres_endpoint" {
+  description = "Active PostgreSQL database host managed by Terraform"
+  value       = local.postgres_host
+}
+
